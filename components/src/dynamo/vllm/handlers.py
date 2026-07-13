@@ -76,7 +76,7 @@ from dynamo.llm import (
     register_model,
     unregister_model,
 )
-from dynamo.llm.exceptions import EngineShutdown
+from dynamo.llm.exceptions import EngineShutdown, HttpError
 from dynamo.runtime import Client
 from dynamo.runtime.logging import configure_dynamo_logging
 from dynamo.vllm.kv_connector_protocols import (
@@ -2762,14 +2762,21 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         request_id,
                         lora_request,
                     )
-                    # Use string format "error: message" for consistency with vLLM's string-based finish_reason
-                    # Rust will parse this into FinishReason::Error(message)
-                    yield {
-                        "finish_reason": "error: No outputs from vLLM engine",
-                        "index": 0,
-                        "token_ids": [],
-                    }
-                    break
+                    # Raise rather than yield a bare dict: a plain-data yield
+                    # here would skip the Rust bridge's OpenAI-schema
+                    # deserialization (it requires `id`, which this ad-hoc
+                    # dict never carried) and crash with an opaque
+                    # "application-logic-mismatch: missing field id" error
+                    # instead of a clean, retryable HTTP-shaped one.
+                    # HttpError(code, message) is recognized by the Rust
+                    # bridge's extract_http_like_error() and surfaces as a
+                    # proper SSE `event: error` frame with this status code,
+                    # which client SDKs/agent harnesses treat as retryable.
+                    raise HttpError(
+                        503,
+                        "vLLM engine returned no outputs for this request "
+                        "(likely a transient grammar/sampling failure) -- safe to retry",
+                    )
 
                 prepared_outputs = []
                 for output in res.outputs:
