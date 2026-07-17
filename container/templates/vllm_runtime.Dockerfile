@@ -54,17 +54,32 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 # stable prefix so non-Python consumers use the same NIXL copy that Python imports.
 # This keeps Rust nixl-sys dlopen("libnixl.so") from falling into stub mode in
 # processes that do not import the nixl Python package first.
-ARG SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/dist-packages
 ENV NIXL_PREFIX=/opt/dynamo/nixl \
     NIXL_LIB_DIR=/opt/dynamo/nixl \
     NIXL_PLUGIN_DIR=/opt/dynamo/nixl/plugins
 COPY --chmod=755 container/deps/vllm/install_nixl_from_wheel.sh /usr/local/bin/install_nixl_from_wheel
-RUN install_nixl_from_wheel \
+# uv wrapper that installs into the base's Python environment whether that is
+# system Python (official base) or a venv (e.g. lmcache/vllm-openai -> /opt/venv).
+COPY --chmod=755 container/deps/vllm/uv_pip_install.sh /usr/local/bin/dynamo-uv-pip
+# Resolve site-packages from the active interpreter rather than hardcoding the
+# system dist-packages path: a cuda base may ship the nixl-cu* wheel in a venv
+# (e.g. lmcache/vllm-openai -> /opt/venv), so python3's purelib is the only
+# portable way to locate it. Identical to dist-packages on the official base.
+RUN SITE_PACKAGES="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" && \
+    install_nixl_from_wheel \
     --cuda-major "${CUDA_MAJOR}" \
     --site-packages "${SITE_PACKAGES}" \
     --prefix "${NIXL_PREFIX}" \
     --skip-headers
 ENV LD_LIBRARY_PATH=${NIXL_LIB_DIR}:${NIXL_PLUGIN_DIR}:${LD_LIBRARY_PATH:-}
+# The nixl-cu* wheel exposes its Python module under the CUDA-suffixed import
+# name (e.g. nixl_cu13), but vLLM/Dynamo/lmcache import the canonical `nixl`
+# (`from nixl._api import ...`). Without it, serving fails at runtime with
+# `RuntimeError: NIXL is not available` even though the native libs above are
+# wired. Alias the canonical name to the installed CUDA-suffixed wheel. No-op on
+# the official base that already ships a top-level `nixl` package.
+COPY --chmod=755 container/deps/vllm/install_nixl_python_alias.sh /usr/local/bin/install_nixl_python_alias
+RUN install_nixl_python_alias
 {% endif %}
 
 # Install NATS and ETCD
@@ -115,7 +130,9 @@ RUN apt-get update && \
 COPY --chmod=664 --chown=dynamo:0 LICENSE /workspace/
 COPY --chmod=775 --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
 
-{% set pip_target = "--system" if device == "cuda" else "--python /opt/venv/bin/python" %}
+{# cuda: use the dynamo-uv-pip wrapper (system Python on the official base, or
+   the base's venv on a venv base like lmcache). non-cuda: unchanged. #}
+{% set uv_pip = "dynamo-uv-pip" if device == "cuda" else "uv pip install --python /opt/venv/bin/python" %}
 {% if device != "cuda" %}
 # NIXL meta package always tries to find a cuda-backend
 # https://github.com/ai-dynamo/nixl/blob/v1.1.0/src/bindings/python/nixl-meta/nixl/__init__.py
@@ -128,8 +145,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     set -eu; \
     export UV_CACHE_DIR=/root/.cache/uv; \
     NIXL_VERSION="${NIXL_REF#v}"; \
-    uv pip install \
-        {{ pip_target }} --force-reinstall --no-deps \
+    {{ uv_pip }} --force-reinstall --no-deps \
         "nixl==${NIXL_VERSION}" \
         "nixl-cu12==${NIXL_VERSION}"
 {% endif %}
@@ -139,7 +155,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 {% if device != "cuda" %}
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     export UV_CACHE_DIR=/root/.cache/uv && \
-    uv pip install {{ pip_target }} --no-deps /opt/dynamo/wheelhouse/nixl/nixl*.whl
+    {{ uv_pip }} --no-deps /opt/dynamo/wheelhouse/nixl/nixl*.whl
 {% endif %}
 
 {% if target not in ("dev", "local-dev") %}
@@ -151,15 +167,15 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 # Use --no-deps to prevent dependency conflicts (e.g., KVBM downgrading nixl).
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     export UV_CACHE_DIR=/root/.cache/uv && \
-    uv pip install {{ pip_target }} --no-deps /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl && \
-    uv pip install {{ pip_target }} --no-deps /opt/dynamo/wheelhouse/ai_dynamo*any.whl && \
+    {{ uv_pip }} --no-deps /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl && \
+    {{ uv_pip }} --no-deps /opt/dynamo/wheelhouse/ai_dynamo*any.whl && \
     if [ "${ENABLE_KVBM}" = "true" ]; then \
         KVBM_WHEEL=$(ls /opt/dynamo/wheelhouse/kvbm*.whl 2>/dev/null | head -1); \
-        if [ -n "$KVBM_WHEEL" ]; then uv pip install {{ pip_target }} --no-deps "$KVBM_WHEEL"; fi; \
+        if [ -n "$KVBM_WHEEL" ]; then {{ uv_pip }} --no-deps "$KVBM_WHEEL"; fi; \
     fi && \
     if [ "${ENABLE_GPU_MEMORY_SERVICE}" = "true" ]; then \
         GMS_WHEEL=$(ls /opt/dynamo/wheelhouse/gpu_memory_service*.whl 2>/dev/null | head -1); \
-        if [ -n "$GMS_WHEEL" ]; then uv pip install {{ pip_target }} --no-deps "$GMS_WHEEL"; fi; \
+        if [ -n "$GMS_WHEEL" ]; then {{ uv_pip }} --no-deps "$GMS_WHEEL"; fi; \
     fi
 
 # Launch-script examples use jq for readable curl output like the upstream omni
@@ -200,7 +216,7 @@ RUN uv pip uninstall triton && \
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     set -eux; \
     export UV_CACHE_DIR=/root/.cache/uv; \
-    uv pip install {{ pip_target }} --no-deps \
+    {{ uv_pip }} --no-deps \
         "modelexpress==${MODELEXPRESS_VERSION}"
 {% endif %}
 
@@ -267,7 +283,7 @@ ENV IMAGEIO_FFMPEG_EXE=/usr/local/bin/ffmpeg
 RUN --mount=type=bind,source=./container/deps/requirements.vllm.txt,target=/tmp/requirements.vllm.txt \
     --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     export UV_CACHE_DIR=/root/.cache/uv && \
-    uv pip install {{ pip_target }} --reinstall-package imageio-ffmpeg --no-deps \
+    {{ uv_pip }} --reinstall-package imageio-ffmpeg --no-deps \
         --requirement /tmp/requirements.vllm.txt
 
 # Remove the vLLM source tree shipped in the base image to avoid pytest

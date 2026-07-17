@@ -36,15 +36,24 @@ PY
 
 export VLLM_OMNI_TARGET_DEVICE
 
-# Use --system flag only for CUDA (system Python), omit for CPU/XPU (venv)
-if [ "${VLLM_OMNI_TARGET_DEVICE}" = "cuda" ]; then
-  uv pip install --system \
-    --prerelease=allow \
-    --constraints "${PROTECTED_CONSTRAINTS}" \
-    "vllm-omni==${VLLM_OMNI_VERSION}"
+# Install vLLM-Omni into whatever Python environment the base provides, matching
+# container/deps/vllm/uv_pip_install.sh:
+#   - VIRTUAL_ENV active  -> install into that venv (CPU/XPU set VIRTUAL_ENV)
+#   - /opt/venv present   -> a venv base that only activates via PATH and leaves
+#                            VIRTUAL_ENV unset (e.g. lmcache/vllm-openai); target
+#                            it explicitly so vLLM-Omni lands where vLLM lives
+#   - otherwise + CUDA    -> --system (official vllm/vllm-openai system Python)
+if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then
+  PIP_TARGET=()
+elif [ -x /opt/venv/bin/python ]; then
+  PIP_TARGET=(--python /opt/venv/bin/python)
+elif [ "${VLLM_OMNI_TARGET_DEVICE}" = "cuda" ]; then
+  PIP_TARGET=(--system)
 else
-  uv pip install \
-    --prerelease=allow \
-    --constraints "${PROTECTED_CONSTRAINTS}" \
-    "vllm-omni==${VLLM_OMNI_VERSION}"
+  PIP_TARGET=()
 fi
+
+uv pip install "${PIP_TARGET[@]}" \
+  --prerelease=allow \
+  --constraints "${PROTECTED_CONSTRAINTS}" \
+  "vllm-omni==${VLLM_OMNI_VERSION}"
