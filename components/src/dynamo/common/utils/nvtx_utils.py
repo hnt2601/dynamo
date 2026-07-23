@@ -40,6 +40,21 @@ ENABLED: bool = bool(int(os.getenv("DYN_NVTX", "0")))
 if ENABLED:
     import nvtx as _nvtx_lib
 
+    # nvtx resolves color names to hex via a tiny built-in table and otherwise
+    # falls back to matplotlib -- an ImportError there raises "Invalid color ...".
+    # The vllm/vllm-openai runtime base ships no matplotlib, so any color name
+    # outside nvtx's table (magenta/pink/lime, used by the multimodal markers)
+    # crashes worker import under DYN_NVTX=1. Pre-map those to ARGB ints, which
+    # nvtx accepts directly, so profiling never depends on matplotlib.
+    _COLOR_OVERRIDES: dict = {
+        "magenta": 0xFF00FF,
+        "pink": 0xFFC0CB,
+        "lime": 0x00FF00,
+    }
+
+    def _normalize_color(color):
+        return _COLOR_OVERRIDES.get(color, color)
+
     # Named domain + pre-allocated EventAttributes: no per-call object
     # allocation or domain cache lookups on the hot path.
     _domain = _nvtx_lib.get_domain("dynamo")
@@ -49,7 +64,9 @@ if ENABLED:
         try:
             return _attr_cache[message, color]
         except KeyError:
-            attr = _domain.get_event_attributes(message=message, color=color)
+            attr = _domain.get_event_attributes(
+                message=message, color=_normalize_color(color)
+            )
             _attr_cache[message, color] = attr
             return attr
 
@@ -59,9 +76,12 @@ if ENABLED:
     def end_range(rng) -> None:
         _domain.end_range(rng)
 
-    # functools.partial so decorator and context-manager usage both land
-    # in the "dynamo" domain, keeping all markers in one nsys row.
-    annotate = functools.partial(_nvtx_lib.annotate, domain="dynamo")
+    # Wrap nvtx.annotate so decorator and context-manager usage both land in the
+    # "dynamo" domain (one nsys row) and get the same matplotlib-free color mapping.
+    def annotate(message: str = "", color: str = "white", **kwargs):
+        return _nvtx_lib.annotate(
+            message, color=_normalize_color(color), domain="dynamo", **kwargs
+        )
 
     def range_decorator(message: str, color: str = "white"):
         """Decorator that wraps an async generator function with an NVTX range.
