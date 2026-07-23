@@ -41,5 +41,12 @@ RUN mkdir -p /etc/apt/keyrings && \
     test -n "$NSYS_BIN" && ln -sf "$NSYS_BIN" /usr/local/bin/nsys && \
     nsys --version
 
+# Under nsys, Dynamo's NVTX annotations pass named colors (e.g. "magenta"),
+# which the `nvtx` package can only resolve to hex when matplotlib is present.
+# The vllm/vllm-openai base ships no matplotlib, so importing dynamo.vllm dies
+# with "Invalid color magenta". Install it into the same interpreter as vLLM.
+RUN pip install --no-cache-dir matplotlib || \
+    pip install --no-cache-dir --break-system-packages matplotlib
+
 # Restore the unprivileged runtime user baked into the base image.
 USER dynamo
