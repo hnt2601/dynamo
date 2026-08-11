@@ -251,8 +251,10 @@ class RequestHandlerConfig:
     additional_metrics: Optional["AdditionalMetricsCollector"] = None
     max_seq_len: Optional[int] = None
     disagg_machine_id: int = 0  # 10-bit machine_id for snowflake disagg_request_id
-    # Force engine-owned conversation-affinity ADP routing regardless of engine detection.
+    # Force conversation-affinity ADP routing regardless of engine config detection.
     conversation_affinity: bool = False
+    # Select whether the engine or Dynamo owns initial DP-rank placement in affinity mode.
+    conversation_affinity_dp_rank_source: str = "engine"
 
 
 class HandlerBase(BaseGenerativeHandler):
@@ -280,6 +282,9 @@ class HandlerBase(BaseGenerativeHandler):
         # Manual override (--conversation-affinity / DYN_ENGINE_CONV_AFFINITY) to force
         # engine-side assignment of conversation-affinity regardless of engine detection.
         self._engine_conversation_affinity_override: bool = config.conversation_affinity
+        self._conversation_affinity_dp_rank_source: str = (
+            config.conversation_affinity_dp_rank_source
+        )
         self.encode_client = config.encode_client
         self.multimodal_processor = config.multimodal_processor
         self.first_generation = True
@@ -1072,6 +1077,7 @@ class HandlerBase(BaseGenerativeHandler):
         # outputs are interleaved by choice index, so maintain one cursor per
         # choice and emit only the new slice for each Dynamo chunk.
         output_tokens_per_choice: dict[int, int] = {}
+        prompt_logprobs_payload = None
 
         sampling_params = self._override_sampling_params(
             self.default_sampling_params, request
@@ -1091,7 +1097,7 @@ class HandlerBase(BaseGenerativeHandler):
 
             # Handle prompt_logprobs
             prompt_logprobs_value = output_options.get("prompt_logprobs")
-            if prompt_logprobs_value:
+            if prompt_logprobs_value is not None:
                 if hasattr(sampling_params, "prompt_logprobs"):
                     setattr(
                         sampling_params, "prompt_logprobs", int(prompt_logprobs_value)
@@ -1151,9 +1157,8 @@ class HandlerBase(BaseGenerativeHandler):
         # Build trace headers for distributed tracing
         trace_headers = context.trace_headers()
 
-        # Resolve the engine-owned conversation-affinity gate once (lazily; the engine is
-        # initialized by first request). When on, the engine's ConversationAwareADPRouter
-        # picks the attention-DP rank from the conversation id, so we must NOT force a rank.
+        # Resolve the engine conversation-affinity gate once (lazily; the engine is
+        # initialized by first request).
         if self._conversation_affinity is None:
             if (
                 self._engine_conversation_affinity_override
@@ -1182,11 +1187,26 @@ class HandlerBase(BaseGenerativeHandler):
         conversation_params = None
         scheduling_params = None
         if conv_affinity:
-            # Let the engine pick the rank from the conversation id (agent_context.session_id);
-            # do NOT force a rank (an explicit rank is honored before affinity and bypasses it).
             conversation_params = conversation_params_for(
                 session_id_from_request(request)
             )
+            if (
+                self._conversation_affinity_dp_rank_source == "dynamo"
+                and conversation_params is not None
+                and dp_rank is not None
+            ):
+                # TensorRT-LLM#16815 records this explicit first-turn placement as the
+                # conversation binding. On later turns, the recorded binding takes
+                # precedence if Dynamo supplies a different rank.
+                scheduling_params = SchedulingParams(
+                    attention_dp_rank=dp_rank,
+                    attention_dp_relax=False,
+                )
+                logging.debug(
+                    "Using dynamo router dp_rank=%s for initial conversation-affinity "
+                    "placement",
+                    dp_rank,
+                )
         elif dp_rank is not None:
             scheduling_params = SchedulingParams(
                 attention_dp_rank=dp_rank,
@@ -1273,6 +1293,11 @@ class HandlerBase(BaseGenerativeHandler):
                         if top_logprobs:
                             out["top_logprobs"] = top_logprobs
 
+                        if prompt_logprobs_payload is None:
+                            prompt_logprobs_payload = _shared_logprobs.extract_prompt_logprobs_from_completion_output(
+                                output
+                            )
+
                         if output.finish_reason:
                             out["finish_reason"] = output.finish_reason
                         if output.stop_reason:
@@ -1297,6 +1322,11 @@ class HandlerBase(BaseGenerativeHandler):
                                     "Request finished with no finish reason set - "
                                     "this indicates a possible bug"
                                 )
+
+                            if prompt_logprobs_payload is not None:
+                                out.setdefault("engine_data", {})[
+                                    "prompt_logprobs"
+                                ] = prompt_logprobs_payload
 
                             num_input_tokens = len(request.get("token_ids", []))
                             total_completion_tokens = sum(

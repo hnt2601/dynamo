@@ -11,7 +11,9 @@ import math
 import os
 import time as _time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Optional
 
 from vllm.config import VllmConfig
@@ -46,6 +48,7 @@ from .health_check import (
 from .instrumented_scheduler import ENV_FPM_BENCHMARK_OUTPUT_PATH, ENV_FPM_WORKER_ID
 from .multimodal_handlers import EncodeWorkerHandler
 from .publisher import StatLoggerFactory
+from .realtime import RealtimeHandler, RealtimeTranscriptionHandler
 
 logger = logging.getLogger(__name__)
 
@@ -536,6 +539,44 @@ SetupFpmRelayFn = Callable[..., Optional[list]]
 SetupMetricsCollectionFn = Callable[..., None]
 
 
+@dataclass
+class _DecodeWorkerLifecycle:
+    engine_client: Optional[AsyncLLM] = None
+    vllm_config: Optional[VllmConfig] = None
+    handler: Optional[BaseWorkerHandler] = None
+    shutdown_event: asyncio.Event | None = None
+
+    def __enter__(self) -> "_DecodeWorkerLifecycle":
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        original_error: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            if original_error is None:
+                raise
+            logger.exception(
+                "Failed to clean up decode worker after an earlier failure"
+            )
+
+    def cleanup(self) -> None:
+        """Release resources in reverse construction order."""
+        logger.debug("Cleaning up decode worker")
+        if self.shutdown_event is not None:
+            self.shutdown_event.set()
+        try:
+            if self.handler is not None:
+                self.handler.cleanup()
+        finally:
+            if self.engine_client is not None and self.vllm_config is not None:
+                self.engine_client.shutdown(timeout=self.vllm_config.shutdown_timeout)
+
+
 class WorkerFactory:
     """Factory for creating and initializing multimodal vLLM workers."""
 
@@ -562,6 +603,16 @@ class WorkerFactory:
         snapshot_engine: Optional[EngineSetupResult] = None,
     ) -> None:
         """Create the appropriate multimodal worker based on config flags."""
+
+        if config.realtime:
+            await self._create_realtime_worker(
+                runtime,
+                config,
+                shutdown_event,
+                shutdown_endpoints,
+                snapshot_engine=snapshot_engine,
+            )
+            return
 
         # Embedding worker is selected first because it crosses worker shapes
         # (pooling AsyncLLM, ModelType.Embedding) rather than being a variant
@@ -598,6 +649,102 @@ class WorkerFactory:
                 snapshot_engine=snapshot_engine,
             )
         return
+
+    async def _create_realtime_worker(
+        self,
+        runtime: DistributedRuntime,
+        config: Config,
+        shutdown_event: asyncio.Event,
+        shutdown_endpoints: list,
+        snapshot_engine: Optional[EngineSetupResult] = None,
+    ) -> None:
+        """Initialize an aggregated vLLM realtime worker."""
+        del shutdown_event  # Connection cancellation is carried by Dynamo Context.
+
+        generate_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.{config.endpoint}"
+        )
+        shutdown_endpoints[:] = [generate_endpoint]
+
+        fpm_worker_id = str(generate_endpoint.connection_id())
+        if snapshot_engine is not None:
+            (
+                engine_client,
+                vllm_config,
+                _default_sampling_params,
+                prometheus_temp_dir,
+                component_gauges,
+            ) = snapshot_engine
+            os.environ[ENV_FPM_WORKER_ID] = fpm_worker_id
+            factory = StatLoggerFactory(
+                endpoint=generate_endpoint,
+                component_gauges=component_gauges,
+            )
+        else:
+            factory = StatLoggerFactory(endpoint=generate_endpoint)
+            (
+                engine_client,
+                vllm_config,
+                _default_sampling_params,
+                prometheus_temp_dir,
+                component_gauges,
+            ) = self.setup_vllm_engine(
+                config,
+                factory,
+                fpm_worker_id=fpm_worker_id,
+            )
+        await configure_kv_event_block_size(engine_client, vllm_config)
+        _, dp_size = get_dp_range_for_worker(vllm_config)
+        num_gpu_blocks = per_rank_kv_blocks(
+            vllm_config.cache_config.num_gpu_blocks,
+            dp_size,
+        )
+        factory.set_num_gpu_blocks_all(num_gpu_blocks or 0)
+        factory.init_publish()
+
+        model_name = config.served_model_name or config.model
+        handler = RealtimeHandler(
+            {
+                "transcription": RealtimeTranscriptionHandler.from_engine(
+                    engine_client=engine_client,
+                    model_name=model_name,
+                    model_path=config.model,
+                )
+            }
+        )
+        self.setup_metrics_collection(config, generate_endpoint, logger)
+
+        await self.register_vllm_model(
+            ModelInput.Text,
+            ModelType.Realtime,
+            generate_endpoint,
+            config,
+            engine_client,
+            vllm_config,
+            worker_type=WorkerType.Aggregated,
+            needs=[],
+        )
+
+        metrics_labels = [
+            (prometheus_names.labels.MODEL, model_name),
+            (prometheus_names.labels.MODEL_NAME, model_name),
+        ]
+        logger.info(
+            "Starting realtime worker endpoint for model: %s",
+            model_name,
+        )
+        try:
+            await generate_endpoint.serve_bidirectional_endpoint(
+                handler.generate,
+                graceful_shutdown=True,
+                metrics_labels=metrics_labels,
+            )
+        except Exception as exc:
+            logger.error("Realtime worker failed: %s", exc)
+            raise
+        finally:
+            if prometheus_temp_dir is not None:
+                prometheus_temp_dir.cleanup()
 
     async def _create_multimodal_encode_worker(
         self,
@@ -762,7 +909,7 @@ class WorkerFactory:
         engine re-exposes its persisted switch counters within seconds. Uses a
         dedicated registry surfaced on ``generate_endpoint``'s system /metrics.
         """
-        if not config.gms_shadow_mode:
+        if config.gms_shadow_mode is not True:
             return None
         from gpu_memory_service.failover_lock.failover_metrics import (
             create_failover_metrics,
@@ -792,7 +939,7 @@ class WorkerFactory:
     ) -> bool:
         # Shadow mode: sleep → probe → block on lock → wake. True only for a real
         # (contended) failover, not the initial bootup.
-        if not config.gms_shadow_mode:
+        if config.gms_shadow_mode is not True:
             return False
 
         await handler._pause_controller.pause(1)
@@ -834,6 +981,26 @@ class WorkerFactory:
         """
         Instantiate and serve
         """
+        with _DecodeWorkerLifecycle(shutdown_event=shutdown_event) as lifecycle:
+            await self._run_decode_worker(
+                runtime,
+                config,
+                shutdown_event,
+                shutdown_endpoints,
+                snapshot_engine=snapshot_engine,
+                lifecycle=lifecycle,
+            )
+
+    async def _run_decode_worker(
+        self,
+        runtime: DistributedRuntime,
+        config: Config,
+        shutdown_event: asyncio.Event,
+        shutdown_endpoints: list,  # mutated in place
+        snapshot_engine: Optional[EngineSetupResult],
+        lifecycle: _DecodeWorkerLifecycle,
+    ) -> None:
+        """Initialize and serve a decode worker."""
 
         generate_endpoint = runtime.endpoint(
             f"{config.namespace}.{config.component}.{config.endpoint}"
@@ -909,6 +1076,8 @@ class WorkerFactory:
                 prometheus_temp_dir,
                 component_gauges,
             ) = self.setup_vllm_engine(config, factory, fpm_worker_id=fpm_worker_id)
+        lifecycle.engine_client = engine_client
+        lifecycle.vllm_config = vllm_config
         await configure_kv_event_block_size(engine_client, vllm_config)
 
         # TODO Hack to get data, move this to registering in TBD
@@ -941,6 +1110,7 @@ class WorkerFactory:
             enable_frontend_decoding=config.frontend_decoding,
             encode_worker_client=encode_worker_client,
         )
+        lifecycle.handler = handler
         handler.add_temp_dir(prometheus_temp_dir)
 
         # Check if kv event consolidator is enabled (port was allocated in setup_vllm_engine)
@@ -1120,10 +1290,6 @@ class WorkerFactory:
         except Exception as e:
             logger.error(f"Failed to serve endpoints: {e}")
             raise
-        finally:
-            logger.debug("Cleaning up decode worker")
-            # Cleanup background tasks
-            handler.cleanup()
 
     async def _create_prefill_worker(
         self,
