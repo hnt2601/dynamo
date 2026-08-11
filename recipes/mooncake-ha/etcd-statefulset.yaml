@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# OPTIONAL — dedicated etcd for Mooncake master HA.
+#
+# Only apply this if you do NOT already have a reusable app-level etcd. If Dynamo
+# or LMCache already run etcd at <svc>.<namespace>.svc.cluster.local:2379, reuse
+# that instead (point mooncake-master.yaml --etcd_endpoints at it with a distinct
+# --cluster_id) and skip this file entirely.
+#
+# This is a minimal single-replica etcd for demo/small clusters. For production
+# HA, run a real 3/5-node etcd quorum (e.g. the etcd Helm chart or operator).
+#
+# After applying, point mooncake-master.yaml at:  --etcd_endpoints=mooncake-etcd:2379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-etcd
+  labels:
+    app: mooncake-etcd
+spec:
+  clusterIP: None
+  selector:
+    app: mooncake-etcd
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+    - name: peer
+      port: 2380
+      targetPort: 2380
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mooncake-etcd
+  labels:
+    app: mooncake-etcd
+spec:
+  serviceName: mooncake-etcd
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mooncake-etcd
+  template:
+    metadata:
+      labels:
+        app: mooncake-etcd
+    spec:
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.21
+          command: ["etcd"]
+          args:
+            - "--name=mooncake-etcd-0"
+            - "--data-dir=/etcd-data"
+            - "--listen-client-urls=http://0.0.0.0:2379"
+            - "--advertise-client-urls=http://mooncake-etcd:2379"
+            - "--listen-peer-urls=http://0.0.0.0:2380"
+          ports:
+            - name: client
+              containerPort: 2379
+            - name: peer
+              containerPort: 2380
+          volumeMounts:
+            - name: data
+              mountPath: /etcd-data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 4Gi

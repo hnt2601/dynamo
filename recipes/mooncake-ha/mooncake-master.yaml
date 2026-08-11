@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Mooncake master — HIGH-AVAILABILITY (HA) deployment.
+#
+# No image rebuild is required. etcd/redis HA is already compiled into the stock
+# `mooncake_master` binary shipped in the mx-vllm-runtime image; HA is wired up
+# purely through the container `command`/`args` below. (The `k8s` HA backend is a
+# non-functional, unmerged upstream RFC — do NOT use `--ha_backend_type=k8s`.)
+#
+# This variant reuses the cluster's existing app-level etcd — the same one Dynamo
+# and LMCache use at <svc>.<namespace>.svc.cluster.local:2379. A distinct
+# --cluster_id isolates Mooncake's keyspace from those tenants in the shared etcd.
+# Do NOT point this at the control-plane (kube-system) etcd.
+#
+# Redis alternative (instead of etcd), swap the two etcd args for:
+#   - "--ha_backend_type=redis"
+#   - "--ha_backend_connstring=redis://dynamo-redis:6379"
+#
+# Client (mooncake store) env in HA mode:
+#   export MOONCAKE_MASTER="etcd://<svc>.<namespace>.svc.cluster.local:2379"
+#   export MOONCAKE_TE_META_DATA_SERVER="etcd://<svc>.<namespace>.svc.cluster.local:2379"   # or P2PHANDSHAKE
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mooncake-master
+  labels:
+    app: mooncake-master
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mooncake-master
+  template:
+    metadata:
+      labels:
+        app: mooncake-master
+    spec:
+      # Spread the 3 masters across nodes so a single node loss cannot take the
+      # HA quorum below its majority.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: mooncake-master
+      containers:
+        - name: mooncake-master
+          # Stock image — no custom build. Replace with your registry path/tag.
+          image: hub.fci.vn/ncp-modas/containers/mx-vllm-runtime:1.3.0-pd-disagg
+          imagePullPolicy: IfNotPresent
+          command: ["mooncake_master"]
+          args:
+            - "--enable_ha=true"
+            # Reuse the cluster's existing etcd (same DNS Dynamo/LMCache use).
+            # ;-separate multiple endpoints for a real etcd quorum.
+            - "--etcd_endpoints=dynamo-etcd:2379"
+            # Advertised to clients via etcd; must be this pod's routable IP.
+            - "--rpc_address=$(POD_IP)"
+            # Isolate Mooncake's keyspace from other tenants in the shared etcd.
+            - "--cluster_id=dynamo-mooncake"
+          ports:
+            - name: rpc
+              containerPort: 50051
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-master
+  labels:
+    app: mooncake-master
+spec:
+  # Headless: clients resolve individual master pod IPs. The master that holds
+  # the HA lease is discovered via etcd, so a plain per-pod DNS surface is enough.
+  clusterIP: None
+  selector:
+    app: mooncake-master
+  ports:
+    - name: rpc
+      port: 50051
+      targetPort: 50051

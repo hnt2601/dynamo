@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Mooncake master — SINGLE (non-HA) deployment.
+#
+# No image rebuild and no etcd/redis required. `--enable_ha=false` runs a single
+# master; rpc_address defaults to 0.0.0.0. If the pod dies, Kubernetes restarts
+# it (a brief cache blip, not data loss — Mooncake store data lives on the store
+# nodes, not the master). Use this when you do not want to operate etcd/redis and
+# a single master is acceptable.
+#
+# Single master only — do NOT scale replicas above 1 in non-HA mode; each replica
+# would be an independent, unsynchronized master.
+#
+# Client (mooncake store) env in single mode — static address, NOT etcd://:
+#   export MOONCAKE_MASTER="mooncake-master:50051"
+#   export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"   # or a metadata server you run
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mooncake-master
+  labels:
+    app: mooncake-master
+spec:
+  replicas: 1
+  strategy:
+    # Recreate: never run two masters at once during a rollout.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mooncake-master
+  template:
+    metadata:
+      labels:
+        app: mooncake-master
+    spec:
+      containers:
+        - name: mooncake-master
+          # Stock image — no custom build. Replace with your registry path/tag.
+          image: hub.fci.vn/ncp-modas/containers/mx-vllm-runtime:1.3.0-pd-disagg
+          imagePullPolicy: IfNotPresent
+          command: ["mooncake_master"]
+          args: ["--enable_ha=false"]
+          ports:
+            - name: rpc
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-master
+  labels:
+    app: mooncake-master
+spec:
+  # Stable ClusterIP — clients use a static mooncake-master:50051 address.
+  selector:
+    app: mooncake-master
+  ports:
+    - name: rpc
+      port: 50051
+      targetPort: 50051
