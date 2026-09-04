@@ -23,8 +23,9 @@ use crate::types::{
     openai::{
         audios::OpenAIAudiosStreamingEngine,
         chat_completions::OpenAIChatCompletionsStreamingEngine,
-        completions::OpenAICompletionsStreamingEngine, embeddings::OpenAIEmbeddingsStreamingEngine,
-        generate::GenerateStreamingEngine, images::OpenAIImagesStreamingEngine,
+        classify::OpenAIClassifyStreamingEngine, completions::OpenAICompletionsStreamingEngine,
+        embeddings::OpenAIEmbeddingsStreamingEngine, generate::GenerateStreamingEngine,
+        images::OpenAIImagesStreamingEngine, pooling::OpenAIPoolingStreamingEngine,
         videos::OpenAIVideosStreamingEngine,
     },
 };
@@ -84,6 +85,7 @@ struct NamespaceReadinessEval {
     legacy_live_workers: usize,
     present: std::collections::HashSet<crate::worker_type::WorkerType>,
     missing: std::collections::HashSet<crate::worker_type::WorkerType>,
+    ambiguous: std::collections::HashSet<crate::worker_type::WorkerType>,
 }
 
 /// A named model backed by one or more WorkerSets.
@@ -164,6 +166,21 @@ impl Model {
             .collect()
     }
 
+    /// Build an immutable membership snapshot for request-plane publication.
+    ///
+    /// WorkerSets themselves are shared because their engines and routing lifecycle are
+    /// long-lived. The membership map is copied so later discovery mutations cannot leak
+    /// through an older published catalog.
+    pub(crate) fn snapshot(&self) -> Self {
+        let snapshot = Self::new(self.name.clone());
+        for entry in &self.worker_sets {
+            snapshot
+                .worker_sets
+                .insert(entry.key().clone(), entry.value().clone());
+        }
+        snapshot
+    }
+
     /// Check if this model has any decode engine (chat or completions) across any WorkerSet.
     pub fn has_decode_engine(&self) -> bool {
         self.worker_sets
@@ -197,6 +214,20 @@ impl Model {
         self.worker_sets
             .iter()
             .any(|entry| entry.value().has_embeddings_engine())
+    }
+
+    /// Check if any WorkerSet has a classify engine.
+    pub fn has_classify_engine(&self) -> bool {
+        self.worker_sets
+            .iter()
+            .any(|entry| entry.value().has_classify_engine())
+    }
+
+    /// Check if any WorkerSet has a pooling engine.
+    pub fn has_pooling_engine(&self) -> bool {
+        self.worker_sets
+            .iter()
+            .any(|entry| entry.value().has_pooling_engine())
     }
 
     /// Check if any WorkerSet has a tensor engine.
@@ -239,6 +270,14 @@ impl Model {
         self.worker_sets
             .iter()
             .any(|entry| entry.value().has_generate_engine())
+    }
+
+    /// Check whether a Generate worker also advertises `capability`.
+    pub fn has_generate_engine_for_capability(&self, capability: &str) -> bool {
+        self.worker_sets.iter().any(|entry| {
+            let worker_set = entry.value();
+            worker_set.has_generate_engine() && worker_set.supports_runtime_capability(capability)
+        })
     }
 
     // -- Model serving readiness --
@@ -292,8 +331,10 @@ impl Model {
     /// and old aggregated workers are indistinguishable on the wire. Rather than
     /// hide the model, we fall back to legacy behavior and report ready as long
     /// as some worker is live. Strict worker-type readiness gating resumes automatically once
-    /// every worker in the namespace carries a `worker_type`. Remove this branch
-    /// when the compat shim is retired.
+    /// every worker in the namespace carries a `worker_type`.
+    ///
+    /// TODO(v1.5): Remove this branch with the legacy MDC topology shims after
+    /// the v1.2 compatibility window expires.
     pub fn is_workers_ready(&self, namespace: &str) -> bool {
         let wsets: Vec<Arc<WorkerSet>> = self
             .worker_sets
@@ -314,80 +355,32 @@ impl Model {
     /// the same `needs`). A legacy card (no `worker_type`) bypasses the strict
     /// check: ready iff any worker is live. Empty `wsets` is not ready.
     fn evaluate_namespace(&self, wsets: &[Arc<WorkerSet>]) -> NamespaceReadinessEval {
-        let mut present: std::collections::HashSet<crate::worker_type::WorkerType> =
-            std::collections::HashSet::new();
-        let mut missing: std::collections::HashSet<crate::worker_type::WorkerType> =
-            std::collections::HashSet::new();
-        let mut has_legacy = false;
-        let mut legacy_live_workers = 0usize;
-        let mut has_live_worker = false;
-
-        // First pass: which worker types have a live worker (+ legacy detection).
-        for ws in wsets {
-            let count = ws.worker_count();
-            if count > 0 {
-                has_live_worker = true;
-            }
-            match Self::ws_type_and_needs(ws) {
-                Some((wt, _needs)) => {
-                    if count > 0 {
-                        present.insert(wt);
-                    }
-                }
-                // No declared worker_type → legacy card.
-                None => {
-                    has_legacy = true;
-                    legacy_live_workers += count;
-                }
-            }
-        }
-
-        // COMPAT branch: a legacy card disables strict gating; the disaggregated
-        // worker types can't be reconstructed, so ready iff any worker is live.
-        if has_legacy {
+        let units = wsets
+            .iter()
+            .map(|ws| match Self::ws_type_and_needs(ws) {
+                Some((worker_type, needs)) => super::readiness::ReadinessUnit {
+                    worker_type: Some(worker_type),
+                    live_count: ws.worker_count(),
+                    needs,
+                },
+                None => super::readiness::ReadinessUnit {
+                    worker_type: None,
+                    live_count: ws.worker_count(),
+                    needs: Vec::new(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let eval = super::readiness::evaluate_readiness(&units);
+        if eval.has_legacy {
             warn_legacy_readiness_once(&self.name, wsets[0].namespace());
-            return NamespaceReadinessEval {
-                ready: has_live_worker,
-                has_legacy,
-                legacy_live_workers,
-                present,
-                missing,
-            };
         }
-
-        // Strict path: a registered worker type with no live worker anywhere is
-        // missing; a *live* WorkerSet whose `needs` DNF is unsatisfied flags its
-        // absent peers.
-        for ws in wsets {
-            let Some((wt, needs)) = Self::ws_type_and_needs(ws) else {
-                continue;
-            };
-            if !present.contains(&wt) {
-                missing.insert(wt);
-            }
-            if ws.worker_count() == 0 || needs.is_empty() {
-                continue;
-            }
-            let satisfied = needs
-                .iter()
-                .any(|alt| alt.iter().all(|t| present.contains(t)));
-            if !satisfied {
-                for alt in &needs {
-                    for t in alt {
-                        if !present.contains(t) {
-                            missing.insert(*t);
-                        }
-                    }
-                }
-            }
-        }
-
         NamespaceReadinessEval {
-            ready: has_live_worker && missing.is_empty(),
-            has_legacy,
-            legacy_live_workers,
-            present,
-            missing,
+            ready: eval.ready,
+            has_legacy: eval.has_legacy,
+            legacy_live_workers: eval.legacy_live_workers,
+            present: eval.present,
+            missing: eval.missing,
+            ambiguous: eval.ambiguous,
         }
     }
 
@@ -408,7 +401,7 @@ impl Model {
     /// Structured per-namespace worker readiness for this model — the data
     /// behind the `GET /v1/models/{model}/ready` observability endpoint.
     ///
-    /// Built on the same [`Self::evaluate_namespace`] facts the serving gate
+    /// Built on the same `Self::evaluate_namespace` facts the serving gate
     /// uses, so the reported `ready`/`missing` can never disagree with routing;
     /// this method only layers display data (per-type counts, reason strings).
     pub fn namespace_readiness(&self) -> ModelReadiness {
@@ -470,6 +463,14 @@ impl Model {
                 }
             } else if eval.has_legacy {
                 Some("legacy worker(s) present but no live worker".to_string())
+            } else if !eval.ambiguous.is_empty() {
+                let mut roles = eval
+                    .ambiguous
+                    .iter()
+                    .map(|worker_type| worker_type.as_str())
+                    .collect::<Vec<_>>();
+                roles.sort_unstable();
+                Some(format!("ambiguous worker types: {}", roles.join(", ")))
             } else {
                 Some(format!("missing worker types: {}", missing_vec.join(", ")))
             };
@@ -508,7 +509,7 @@ impl Model {
     /// where a `ModelDeploymentCard` is registered before its WorkerSet has
     /// been wired up.
     ///
-    /// Delegates to [`Self::select_worker_set_with`] so readiness reports
+    /// Delegates to `Self::select_worker_set_with` so readiness reports
     /// exactly what request routing would accept — including the namespace
     /// completeness gate. Without that, a live decode-only WorkerSet with a
     /// chat engine but no prefill peer would report ready while every request
@@ -557,6 +558,16 @@ impl Model {
             .ok_or_else(|| self.engine_error(self.has_embeddings_engine()))
     }
 
+    pub fn get_classify_engine(&self) -> Result<OpenAIClassifyStreamingEngine, ModelManagerError> {
+        self.select_worker_set_with(|ws| ws.classify_engine.clone())
+            .ok_or_else(|| self.engine_error(self.has_classify_engine()))
+    }
+
+    pub fn get_pooling_engine(&self) -> Result<OpenAIPoolingStreamingEngine, ModelManagerError> {
+        self.select_worker_set_with(|ws| ws.pooling_engine.clone())
+            .ok_or_else(|| self.engine_error(self.has_pooling_engine()))
+    }
+
     pub fn get_images_engine(&self) -> Result<OpenAIImagesStreamingEngine, ModelManagerError> {
         self.select_worker_set_with(|ws| ws.images_engine.clone())
             .ok_or_else(|| self.engine_error(self.has_images_engine()))
@@ -585,6 +596,19 @@ impl Model {
     pub fn get_generate_engine(&self) -> Result<GenerateStreamingEngine, ModelManagerError> {
         self.select_worker_set_with(|ws| ws.generate_engine.clone())
             .ok_or_else(|| self.engine_error(self.has_generate_engine()))
+    }
+    /// Get a Generate engine from a worker advertising `capability`.
+    pub fn get_generate_engine_for_capability(
+        &self,
+        capability: &str,
+    ) -> Result<GenerateStreamingEngine, ModelManagerError> {
+        self.select_worker_set_with(|worker_set| {
+            worker_set
+                .supports_runtime_capability(capability)
+                .then(|| worker_set.generate_engine.clone())
+                .flatten()
+        })
+        .ok_or_else(|| self.engine_error(self.has_generate_engine_for_capability(capability)))
     }
 
     // -- Combined engine + parsing options (atomically from one WorkerSet) --
@@ -1044,8 +1068,7 @@ mod tests {
             dynamo_runtime::pipeline::RouterMode::RoundRobin,
             None,
         );
-        pr.mark_active_for_test();
-        pr.deactivate();
+        pr.set_target(None);
         ws.prefill_router = Some(pr);
         Arc::new(ws)
     }

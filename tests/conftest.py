@@ -230,6 +230,11 @@ def pytest_configure(config: pytest.Config) -> None:
         "elastic_ep: marks vLLM elastic expert-parallelism (ePLB) scaling tests "
         "(scale_elastic_ep over the Ray DP backend)",
     )
+    config.addinivalue_line(
+        "markers",
+        "token_budget_parity: compares native backend and Dynamo prompt/output "
+        "overflow behavior",
+    )
 
     models_dir = config.getoption("--models-dir", default=None)
     if models_dir and not Path(models_dir).is_dir():
@@ -1285,6 +1290,8 @@ def dynamo_dynamic_ports(num_system_ports) -> Generator[ServicePorts, None, None
         all_ports.extend(system_port_list)
         kv_event_port = allocate_port(DynamoPortRange.SERVE.value)
         all_ports.append(kv_event_port)
+        fpm_port = allocate_port(DynamoPortRange.FPM.value)
+        all_ports.append(fpm_port)
         # One NIXL side-channel port per worker (avoids xdist collisions on shared hosts).
         nixl_side_channel_ports = allocate_ports(
             num_system_ports, DynamoPortRange.NIXL.value
@@ -1294,6 +1301,7 @@ def dynamo_dynamic_ports(num_system_ports) -> Generator[ServicePorts, None, None
             frontend_port=frontend_port,
             system_ports=system_port_list,
             kv_event_port=kv_event_port,
+            fpm_port=fpm_port,
             nixl_side_channel_ports=nixl_side_channel_ports,
         )
     finally:
